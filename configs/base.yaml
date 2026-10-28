@@ -1,0 +1,9 @@
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+
+forecast:
+  horizons: [1, 2, 3, 4, 5, 6]
+  bin: 1h
+  grain: community_area
