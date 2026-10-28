@@ -22,8 +22,8 @@ See [ADR 0001](docs/decisions/0001-stack-and-task-definition.md) for the reasoni
 Requires [uv](https://docs.astral.sh/uv/) and git. uv installs the pinned Python version itself.
 
 ```bash
-git clone <repo-url>
-cd <repo-folder>
+git clone https://github.com/als-217/rideshare-forecast
+cd rideshare-forecast
 make setup      # installs dependencies and git hooks
 make check      # lint + type check + tests
 ```
