@@ -40,6 +40,14 @@ def test_valid_data_parses():
     assert cfg.forecast.horizons == [1, 2]
 
 
+def test_unsupported_bin_rejected():
+    """A bin size other than 1h is rejected until other sizes are supported."""
+    data = make_valid_data()
+    data["forecast"]["bin"] = "15min"
+    with pytest.raises(ValidationError, match="Input should be '1h'"):
+        Config.model_validate(data)
+
+
 def test_zero_horizon_rejected():
     """A horizon of 0 (predicting the present) is rejected."""
     data = make_valid_data()

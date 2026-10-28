@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -26,8 +27,8 @@ class Forecast(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     horizons: list[int]
-    bin: str
-    grain: str
+    bin: Literal["1h"]
+    grain: Literal["community_area"]
 
     @field_validator("horizons")
     @classmethod
