@@ -45,3 +45,7 @@ select = [
     "SIM", # simplifications
     "C4",  # cleaner comprehensions
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
