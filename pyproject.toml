@@ -29,3 +29,19 @@ dev = [
     "pytest>=9.2.0",
     "ruff>=0.17.3",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes: unused imports, undefined names
+    "I",   # isort: import ordering
+    "UP",  # pyupgrade: modernize syntax for your Python version
+    "B",   # bugbear: common bug patterns
+    "SIM", # simplifications
+    "C4",  # cleaner comprehensions
+]
