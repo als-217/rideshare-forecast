@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Short-term spatiotemporal demand forecasting on Chicago rideshare trip data"
 readme = "README.md"
 authors = [
-    { name = "als-217", email = "alexstratton2121@gmail.com" }
+    { name = "als-217", email = "alexstratton2172@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -29,6 +29,9 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
+]
+notebook = [
+    "ipykernel>=7.4.0",
 ]
 
 [tool.ruff]

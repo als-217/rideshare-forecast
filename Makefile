@@ -14,6 +14,9 @@ setup:
 	uv sync
 	uv run pre-commit install
 
+setup-notebook: setup
+	uv sync --group notebook
+
 lint:
 	uv run ruff check .
 	uv run ruff format --check .
