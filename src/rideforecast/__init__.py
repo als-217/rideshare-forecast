@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from rideforecast!")
+"""Short-term demand forecasting on Chicago rideshare trip data."""
