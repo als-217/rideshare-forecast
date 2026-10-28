@@ -1,13 +1,19 @@
 [project]
 name = "rideforecast"
 version = "0.1.0"
-description = "Add your description here"
+description = "Short-term spatiotemporal demand forecasting on Chicago rideshare trip data"
 readme = "README.md"
 authors = [
     { name = "als-217", email = "alexstratton2121@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "duckdb>=2.0.0",
+    "polars>=2.1.0",
+    "pyarrow>=26.0.0",
+    "pydantic>=2.14.1",
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
 rideforecast = "rideforecast:main"
@@ -15,3 +21,11 @@ rideforecast = "rideforecast:main"
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.7.0",
+    "pyright>=1.1.414",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
