@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Paths(BaseModel):
@@ -59,6 +59,25 @@ class Forecast(BaseModel):
         return v
 
 
+class Ingest(BaseModel):
+    """Settings for the ingest stage (raw CSV -> interim Parquet).
+
+    Attributes:
+        raw_glob: Pattern, relative to `paths.raw`, matching the raw files to ingest.
+            Each file must sit in a folder named after its portal dataset ID.
+        timestamp_format: strptime format of the raw timestamp strings.
+        max_failed_cast_rate: Largest allowed share of a file's rows in which any one
+            column fails to parse (or the start timestamp is missing). Above this, the
+            file is rejected and nothing from it is published.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_glob: str
+    timestamp_format: str
+    max_failed_cast_rate: float = Field(ge=0, le=1)
+
+
 class Config(BaseModel):
     """Top-level project configuration, mirroring the structure of the YAML file."""
 
@@ -66,6 +85,7 @@ class Config(BaseModel):
 
     paths: Paths
     forecast: Forecast
+    ingest: Ingest
 
 
 def load_config(path: str | Path = "configs/base.yaml") -> Config:

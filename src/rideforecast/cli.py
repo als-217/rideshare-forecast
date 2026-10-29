@@ -5,6 +5,7 @@ import typer
 from pydantic import ValidationError
 
 from rideforecast.config import Config, load_config
+from rideforecast.ingest import IngestError, run_ingest
 
 DEFAULT_CONFIG = Path("configs/base.yaml")
 
@@ -42,15 +43,29 @@ def _load(config_path: Path) -> Config:
         raise typer.Exit(code=1) from None
 
 
-@app.command(help="Convert raw trip CSVs into typed Parquet files.")
+@app.command(help="Convert raw trip CSVs into typed, monthly Parquet files.")
 def ingest(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Run the ingest stage (raw -> interim).
 
     Args:
         config: Path to the YAML config file.
+
+    Raises:
+        typer.Exit: With code 1 if any raw file fails its audit.
     """
     cfg = _load(config)
-    typer.echo(f"[ingest] {cfg.paths.raw} -> {cfg.paths.interim} (not implemented)")
+    try:
+        result = run_ingest(cfg)
+    except IngestError as exc:
+        typer.echo(f"[ingest] failed: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    for report in result.files:
+        published = sum(m.rows_published for m in report.months)
+        typer.echo(
+            f"[ingest] {report.path}: {report.rows_read:,} rows read, "
+            f"{published:,} published across {len(report.months)} month(s)"
+        )
+    typer.echo(f"[ingest] manifest: {result.manifest_path}")
 
 
 @app.command(help="Aggregate trips into a zone x hour panel with DuckDB.")
