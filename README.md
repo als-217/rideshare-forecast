@@ -2,7 +2,7 @@
 
 Short-term spatiotemporal demand forecasting on Chicago rideshare (TNP) trip data.
 
-> **Status:** scaffolding complete. Pipeline stages exist as CLI stubs and are not yet implemented.
+> **Status:** ingest implemented. The remaining stages are CLI stubs.
 
 ## The forecasting task
 
@@ -35,7 +35,7 @@ so any stage can be rerun in isolation.
 
 | Stage | Command | Reads | Writes | Status |
 |---|---|---|---|---|
-| Ingest | `uv run rideforecast ingest` | `data/raw` | `data/interim` | not implemented |
+| Ingest | `uv run rideforecast ingest` | `data/raw` | `data/interim/trips` | done |
 | Panel | `uv run rideforecast panel` | `data/interim` | `data/processed` | not implemented |
 | Features | `uv run rideforecast features` | `data/processed` | `data/processed` | not implemented |
 | Train | `uv run rideforecast train` | `data/processed` | models | not implemented |
@@ -45,9 +45,22 @@ Every stage accepts `--config / -c` to use a different YAML config.
 
 ## Data
 
-Source: the City of Chicago Data Portal, Transportation Network Providers trip data.
+Source: the City of Chicago Data Portal, Transportation Network Providers trip data,
+published as three datasets:
 
-TODO: exact dataset name, download instructions, and where to place the files in `data/raw/`.
+| Period | Dataset ID |
+|---|---|
+| Nov 2018 - Dec 2022 | `m6dm-c72p` |
+| 2023 - 2024 | `n26f-ihde` |
+| 2025 onward | `6dvr-xwnh` |
+
+Put gzipped CSV exports in a folder named after their dataset ID, for example
+`data/raw/n26f-ihde/2024-03.csv.gz`. All of a month's trips must be in a single file.
+
+`ingest` parses every column with the rules in `src/rideforecast/schema.py`, removes
+duplicate trip IDs, and writes one Parquet file per month to
+`data/interim/trips/year=YYYY/month=M/`. Each run writes a manifest to
+`data/interim/_manifests/` with checksums, row counts and parse failures per file.
 
 ## Repository layout
 
