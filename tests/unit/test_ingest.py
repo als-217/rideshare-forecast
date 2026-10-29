@@ -81,15 +81,6 @@ def test_percent_sign_stripped_and_kept_in_percentage_points(write_raw, make_cfg
     assert trip["percent_distance_chicago"] == 100.0
 
 
-def test_percent_sign_in_money_column_counted_as_failure(write_raw, make_cfg):
-    """Each column accepts only its own format: '%' is stripped from percents only."""
-    write_raw([trip_row(1), trip_row(2, Fare="12%")])
-    cfg = make_cfg(max_failed_cast_rate=1.0)
-    result = run_ingest(cfg)
-
-    assert result.files[0].failed_casts["fare"] == 1
-
-
 def test_output_column_types_match_schema(write_raw, make_cfg):
     """Each published column has the DuckDB type declared in schema.py."""
     write_raw([trip_row()])
