@@ -13,7 +13,8 @@ This initial data exploration, contained in 'notebooks/01-explore-tnp-sample.ipy
 - Timestamps are in the following format: "%m/%d/%Y %I:%M:%S %p"
 - Timestamps are in local time. Negative durations appear only in the fall-back sample (Nov 5, 2023), and the spring-forward date (Mar 10, 2024) has no start times between 2:00 and 2:59 AM.
 - All dollar-valued columns are numeric once '$' is removed except for those that are NULL. All values in "Trip Seconds" are numeric once ',' is removed except for those that are NULL.
-- Across the three samples, community area pickup has a missing rate of 8.74% and dropoff is 9.15%. Of the rows with a missing Pickup Community Area, 96.9% are also missing Pickup Centroid Location. Of the rows with a missing Dropoff Community Area, 97.4% are also missing Dropoff Centroid Location.
+- Across the three samples, community area pickup has a missing rate of 8.74% and dropoff is 9.15%. Of the rows with a missing Pickup Community Area, 96.9% are also missing Pickup Centroid Location. Of the rows with a missing Dropoff Community Area, 97.4% are also missing Dropoff Centroid Location. There are no changes across time in the null rate.
+- The columns missing from the 2018-2022 dataset are: "Percent Time Chicago", "Percent Distance Chicago", "Shared Trip Match". All shared columns have the same names and the same types.
 
 ## Questions
 
