@@ -58,7 +58,7 @@ def test_ingest_succeeds_on_valid_data(write_raw, make_cfg, tmp_path):
 
     result = runner.invoke(app, ["ingest", "--config", str(config_path)])
     assert result.exit_code == 0, result.output
-    assert "2 published across 1 month(s)" in result.output
+    assert "2024-03: 2 rows published from 1 file(s)" in result.output
     assert "manifest:" in result.output
 
 

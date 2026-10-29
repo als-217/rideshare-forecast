@@ -54,13 +54,35 @@ published as three datasets:
 | 2023 - 2024 | `n26f-ihde` |
 | 2025 onward | `6dvr-xwnh` |
 
-Put gzipped CSV exports in a folder named after their dataset ID, for example
-`data/raw/n26f-ihde/2024-03.csv.gz`. All of a month's trips must be in a single file.
+Put gzipped CSV exports in a folder named after their dataset ID. Each file's name declares
+the trips it contains, by start date (both dates inclusive, within one calendar month):
 
-`ingest` parses every column with the rules in `src/rideforecast/schema.py`, removes
-duplicate trip IDs, and writes one Parquet file per month to
-`data/interim/trips/year=YYYY/month=M/`. Each run writes a manifest to
-`data/interim/_manifests/` with checksums, row counts and parse failures per file.
+```
+data/raw/n26f-ihde/tnp_2024-01-01_to_2024-01-31.csv.gz
+```
+
+A month may be split across several files, and overlapping files are fine: duplicate trips
+are removed. Ingest rejects a file whose name breaks this pattern, spans two months, or
+contains trips outside its declared dates.
+
+`ingest` processes one month at a time, so disk use peaks at one month of staging. Each
+column is parsed with the rules in `src/rideforecast/schema.py`, and each month is written
+to `data/interim/trips/year=YYYY/month=MM/data.parquet`. A failed audit stops the run before
+that month is published; earlier months stay published. Months with days missing from the
+file names, or with declared days that have no trips, produce a warning.
+
+Each run writes a manifest to `data/interim/_manifests/` with checksums, row counts, parse
+failures, duplicates removed and coverage for every file and month.
+
+To read the trips with the year and month folders as integer columns:
+
+```sql
+SELECT * FROM read_parquet(
+    'data/interim/trips/**/*.parquet',
+    hive_partitioning = true,
+    hive_types = {'year': INTEGER, 'month': INTEGER}
+)
+```
 
 ## Repository layout
 

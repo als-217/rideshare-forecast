@@ -95,7 +95,7 @@ def write_raw(raw_dir: Path) -> WriteRaw:
 
     def _write(
         rows: list[dict[str, str]],
-        name: str = "trips.csv.gz",
+        name: str = "tnp_2024-03-01_to_2024-03-31.csv.gz",
         dataset: str = "n26f-ihde",
         header: list[str] | None = None,
     ) -> Path:
@@ -103,7 +103,8 @@ def write_raw(raw_dir: Path) -> WriteRaw:
 
         Args:
             rows: Raw rows, as built by trip_row. Columns missing from a row are empty.
-            name: File name.
+            name: File name, declaring the file's dates. Defaults to all of March 2024,
+                which contains trip_row's default start time.
             dataset: Portal dataset ID, used as the folder name.
             header: Column names to write. Defaults to the newer datasets' header.
 

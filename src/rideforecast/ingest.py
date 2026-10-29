@@ -1,29 +1,36 @@
 """Ingest stage: raw TNP trip CSVs -> typed, deduplicated Parquet, one file per month.
 
-Each raw file goes through a write-audit-publish sequence:
+Raw files must be named `tnp_YYYY-MM-DD_to_YYYY-MM-DD.csv.gz`, with both dates (inclusive)
+in the same calendar month. A month may be split across several files. Ingest groups files
+by month from their names, then runs write-audit-publish one month at a time:
 
-1. **Write.** Every row is parsed with the explicit rules in `schema.py` and written to a
-   staging Parquet file. A `parse_failures` bitmask records which columns failed to parse.
-2. **Audit.** The staged rows are checked: parse-failure rates, rows without a start time,
-   trip-key collisions, and months already published from another file in this run. A
-   failed audit raises IngestError and nothing from the file is published.
-3. **Publish.** Each calendar month is deduplicated on trip ID and written to
-   `interim/trips/year=YYYY/month=M/data.parquet`, replacing that month's previous output.
+1. **Write.** Each of the month's files is parsed with the explicit rules in `schema.py`
+   and written to a staging Parquet file. A `parse_failures` bitmask records which columns
+   failed to parse.
+2. **Audit.** Each file is checked for parse-failure rates, rows without a start time, and
+   rows starting outside the dates in its name. The month as a whole is checked for
+   trip-key collisions across its files.
+3. **Publish.** The month's rows from all its files are deduplicated on trip ID and written
+   to `interim/trips/year=YYYY/month=MM/data.parquet`, replacing the previous output.
+4. **Clean up.** The month's staging files are deleted before the next month starts, so
+   disk use peaks at one month of staging.
 
-Rows are never filtered on content (ADR 0002), with two exceptions: exact trip-ID
-duplicates are removed, and rows without a parseable start time are excluded because they
-cannot be assigned to a month. Both are counted in the run manifest.
-
-Every run writes a JSON manifest to `interim/_manifests/`, whether it succeeds or fails.
+A failed audit stops the run before that month is published. Earlier months stay
+published; each published month is complete and fully audited. Rows are never filtered on
+content (ADR 0002), with two exceptions: duplicate trip IDs are removed, and rows without a
+parseable start time are excluded. Both are counted in the run manifest, which every run
+writes to `interim/_manifests/`, whether it succeeds or fails.
 """
 
+import calendar
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -31,38 +38,52 @@ import duckdb
 from rideforecast.config import Config
 from rideforecast.schema import PARSED, RAW_NAMES, REQUIRED_RAW_NAMES, TRIP_ID, Column
 
+# Raw file names declare the inclusive date range of the trips they contain.
+RAW_NAME_PATTERN = re.compile(
+    r"^tnp_(?P<start>\d{4}-\d{2}-\d{2})_to_(?P<end>\d{4}-\d{2}-\d{2})\.csv(\.\w+)?$"
+)
+
 # First 64 bits of the MD5 digest of the trip ID. MD5 is a fixed, published algorithm, so a
 # trip gets the same key on every run and every DuckDB version. DuckDB's own hash() is not
 # used because it is meant for internal hash tables, not for persisted values.
 TRIP_KEY_SQL = "('0x' || left(md5({raw}), 16))::UBIGINT"
 
-# Which copy of a duplicated trip ID is kept, so reruns always keep the same row.
-DEDUP_ORDER = "trip_end_timestamp NULLS LAST, trip_total NULLS LAST, parse_failures"
+# Which copy of a duplicated trip ID is kept, so reruns always keep the same row. The
+# source file name is the final tie-breaker when the same trip appears in two files.
+DEDUP_ORDER = "trip_end_timestamp NULLS LAST, trip_total NULLS LAST, parse_failures, source_file"
 
 # Row order within a month file. Sorting by time improves compression and lets readers
 # skip row groups when filtering on time.
 OUTPUT_ORDER = "trip_start_timestamp, pickup_community_area"
 
+# Warnings list at most this many missing days; the manifest lists all of them.
+MAX_DAYS_IN_WARNING = 5
+
 
 class IngestError(Exception):
-    """A raw file failed validation. Nothing from that file is published."""
+    """A raw file or month failed validation. Nothing from that month is published."""
 
 
-@dataclass
-class MonthReport:
-    """What was published for one calendar month.
+@dataclass(frozen=True)
+class RawFile:
+    """A raw file and the date range declared in its name.
 
     Attributes:
-        year: Calendar year of the trips' start times.
-        month: Calendar month (1-12) of the trips' start times.
-        rows_published: Rows written to the month's Parquet file.
-        duplicates_removed: Rows dropped because their trip ID appeared more than once.
+        path: Location of the raw file.
+        dataset: Portal dataset ID, taken from the name of the file's folder.
+        start: First day of trips in the file, inclusive.
+        end: Last day of trips in the file, inclusive.
     """
 
-    year: int
-    month: int
-    rows_published: int
-    duplicates_removed: int
+    path: Path
+    dataset: str
+    start: date
+    end: date
+
+    @property
+    def month(self) -> tuple[int, int]:
+        """The (year, month) the file's trips belong to."""
+        return (self.start.year, self.start.month)
 
 
 @dataclass
@@ -72,24 +93,59 @@ class FileReport:
     Attributes:
         path: Location of the raw file.
         dataset: Portal dataset ID, taken from the name of the file's folder.
+        declared_start: First day of trips according to the file name.
+        declared_end: Last day of trips according to the file name.
         size_bytes: Size of the raw file on disk.
         sha256: Checksum of the raw file, to detect if it changes between runs.
         rows_read: Rows in the raw file.
         rows_without_start: Rows with no parseable start timestamp. These are not
             published, because they cannot be assigned to a month.
+        rows_outside_range: Rows starting outside the declared dates. Any such row
+            rejects the file.
         failed_casts: For each parsed column, the number of rows whose raw value did
             not parse and became NULL.
-        months: What was published for each month the file covers.
     """
 
     path: str
     dataset: str
+    declared_start: date
+    declared_end: date
     size_bytes: int
     sha256: str
     rows_read: int = 0
     rows_without_start: int = 0
+    rows_outside_range: int = 0
     failed_casts: dict[str, int] = field(default_factory=dict)
-    months: list[MonthReport] = field(default_factory=list)
+
+
+@dataclass
+class MonthReport:
+    """What was published for one calendar month. Serialized into the run manifest.
+
+    Attributes:
+        year: Calendar year of the trips' start times.
+        month: Calendar month (1-12) of the trips' start times.
+        source_files: The raw files the month was built from.
+        rows_published: Rows written to the month's Parquet file.
+        duplicates_removed: Rows dropped because their trip ID appeared more than once,
+            within one file or across files.
+        first_start: Earliest trip start time in the month.
+        last_start: Latest trip start time in the month.
+        days_with_trips: Number of days with at least one trip.
+        missing_declared_days: Days of the month not covered by any file name.
+        days_without_trips: Days covered by a file name but with no trips.
+    """
+
+    year: int
+    month: int
+    source_files: list[str]
+    rows_published: int = 0
+    duplicates_removed: int = 0
+    first_start: datetime | None = None
+    last_start: datetime | None = None
+    days_with_trips: int = 0
+    missing_declared_days: list[date] = field(default_factory=list)
+    days_without_trips: list[date] = field(default_factory=list)
 
 
 @dataclass
@@ -99,28 +155,32 @@ class IngestResult:
     Attributes:
         manifest_path: Location of the JSON manifest written for the run.
         files: A report for each raw file, in the order they were processed.
+        months: A report for each published month, in calendar order.
+        warnings: Completeness warnings. They do not stop the run.
     """
 
     manifest_path: Path
     files: list[FileReport]
+    months: list[MonthReport]
+    warnings: list[str]
 
 
 def run_ingest(cfg: Config) -> IngestResult:
-    """Ingest every raw file matching the configured glob.
+    """Ingest every raw file matching the configured glob, one month at a time.
 
     Args:
         cfg: Validated project config.
 
     Returns:
-        The manifest location and a report for each raw file.
+        The manifest location, plus reports for each file and month and any warnings.
 
     Raises:
-        IngestError: If no raw files are found or any file fails its audit. Files
-            processed before the failing one stay published. The manifest is still
-            written, with status "failed" and the error message.
+        IngestError: If no raw files are found, a file name is invalid, or a file or
+            month fails its audit. Months published before the failure stay published.
+            The manifest is still written, with status "failed" and the error message.
     """
-    raw_files = sorted(p for p in cfg.paths.raw.glob(cfg.ingest.raw_glob) if p.is_file())
-    if not raw_files:
+    paths = sorted(p for p in cfg.paths.raw.glob(cfg.ingest.raw_glob) if p.is_file())
+    if not paths:
         raise IngestError(f"No raw files match {cfg.ingest.raw_glob!r} in {cfg.paths.raw}")
 
     trips_dir = cfg.paths.interim / "trips"
@@ -128,86 +188,163 @@ def run_ingest(cfg: Config) -> IngestResult:
     manifest_dir = cfg.paths.interim / "_manifests"
 
     started = datetime.now(UTC)
-    reports: list[FileReport] = []
-    published_by: dict[tuple[int, int], str] = {}
+    file_reports: list[FileReport] = []
+    month_reports: list[MonthReport] = []
+    warnings: list[str] = []
     status, error = "succeeded", None
     con = duckdb.connect()
     try:
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        for raw_file in raw_files:
-            reports.append(_ingest_file(con, cfg, raw_file, staging_dir, trips_dir, published_by))
+        by_month = group_by_month([parse_raw_file(p) for p in paths])
+        for (year, month), raw_files in sorted(by_month.items()):
+            report = _ingest_month(
+                con,
+                cfg,
+                year,
+                month,
+                raw_files,
+                staging_dir / f"{year}-{month:02d}",
+                trips_dir,
+                file_reports,
+            )
+            month_reports.append(report)
+            warnings.extend(month_warnings(report))
     except IngestError as exc:
         status, error = "failed", str(exc)
         raise
     finally:
         con.close()
         shutil.rmtree(staging_dir, ignore_errors=True)
-        manifest_path = _write_manifest(manifest_dir, cfg, started, status, error, reports)
-    return IngestResult(manifest_path=manifest_path, files=reports)
+        manifest_path = _write_manifest(
+            manifest_dir, cfg, started, status, error, file_reports, month_reports, warnings
+        )
+    return IngestResult(manifest_path, file_reports, month_reports, warnings)
 
 
-def _ingest_file(
+def parse_raw_file(path: Path) -> RawFile:
+    """Read the declared date range from a raw file's name.
+
+    Args:
+        path: Location of the raw file, inside a folder named after its dataset ID.
+
+    Returns:
+        The file with its dataset and declared dates.
+
+    Raises:
+        IngestError: If the name does not match `tnp_YYYY-MM-DD_to_YYYY-MM-DD.csv.gz`,
+            a date is invalid, the end is before the start, or the dates fall in
+            different calendar months.
+    """
+    match = RAW_NAME_PATTERN.match(path.name)
+    if match is None:
+        raise IngestError(f"{path}: name must look like tnp_YYYY-MM-DD_to_YYYY-MM-DD.csv.gz")
+    try:
+        start = date.fromisoformat(match["start"])
+        end = date.fromisoformat(match["end"])
+    except ValueError:
+        raise IngestError(f"{path}: name contains an invalid date") from None
+    if end < start:
+        raise IngestError(f"{path}: end date is before start date")
+    if (start.year, start.month) != (end.year, end.month):
+        raise IngestError(
+            f"{path}: dates span more than one month. "
+            "Each raw file must cover dates within a single calendar month."
+        )
+    return RawFile(path=path, dataset=path.parent.name, start=start, end=end)
+
+
+def group_by_month(raw_files: list[RawFile]) -> dict[tuple[int, int], list[RawFile]]:
+    """Group raw files by the calendar month their names declare.
+
+    Args:
+        raw_files: Parsed raw files.
+
+    Returns:
+        Each (year, month) mapped to its files, sorted by path.
+    """
+    groups: dict[tuple[int, int], list[RawFile]] = {}
+    for raw_file in sorted(raw_files, key=lambda f: f.path):
+        groups.setdefault(raw_file.month, []).append(raw_file)
+    return groups
+
+
+def _ingest_month(
     con: duckdb.DuckDBPyConnection,
     cfg: Config,
-    raw_file: Path,
+    year: int,
+    month: int,
+    raw_files: list[RawFile],
     staging_dir: Path,
     trips_dir: Path,
-    published_by: dict[tuple[int, int], str],
-) -> FileReport:
-    """Write, audit and publish one raw file.
+    file_reports: list[FileReport],
+) -> MonthReport:
+    """Write, audit and publish one month, then delete its staging files.
 
     Args:
         con: DuckDB connection used for every query.
         cfg: Validated project config.
-        raw_file: The raw CSV to ingest.
-        staging_dir: Directory for the file's temporary staging Parquet file.
+        year: Year of the month.
+        month: Month (1-12).
+        raw_files: The month's raw files.
+        staging_dir: Directory for the month's staging files. Deleted on return.
         trips_dir: Root of the published monthly Parquet files.
-        published_by: Months published so far in this run, mapped to the raw file they
-            came from. Updated with the months this file publishes.
+        file_reports: Reports of files processed so far in the run. A report for each of
+            this month's files is appended, including a file that fails its audit.
 
     Returns:
-        A report of what was read and published.
+        A report of what was published.
 
     Raises:
-        IngestError: If the file fails any check, or contains a month already published
-            from another file in this run. Nothing from the file is published.
+        IngestError: If any file or the month fails its audit. Nothing from the month
+            is published.
     """
-    dataset = raw_file.parent.name
-    report = FileReport(
-        path=raw_file.as_posix(),
-        dataset=dataset,
-        size_bytes=raw_file.stat().st_size,
-        sha256=_sha256(raw_file),
-    )
-    stage_path = staging_dir / f"{dataset}__{raw_file.name}.parquet"
-    stage = f"read_parquet({_quote_str(stage_path.as_posix())})"
-
+    label = f"{year}-{month:02d}"
+    staging_dir.mkdir(parents=True, exist_ok=True)
     try:
-        header = read_header(con, raw_file)
-        check_header(header, raw_file)
-        con.execute(
-            build_stage_sql(raw_file, header, dataset, cfg.ingest.timestamp_format, stage_path)
-        )
-        months = audit_stage(con, stage, report, cfg.ingest.max_failed_cast_rate)
-        check_unique_keys(con, stage)
-    except duckdb.Error as exc:
-        raise IngestError(f"{raw_file}: {exc}") from exc
-
-    for year, month, _ in months:
-        owner = published_by.get((year, month))
-        if owner is not None:
-            raise IngestError(
-                f"{raw_file}: {year}-{month:02d} was already published from {owner}. "
-                "Each month's trips must come from a single raw file."
+        staged = []
+        for raw_file in raw_files:
+            report = FileReport(
+                path=raw_file.path.as_posix(),
+                dataset=raw_file.dataset,
+                declared_start=raw_file.start,
+                declared_end=raw_file.end,
+                size_bytes=raw_file.path.stat().st_size,
+                sha256=_sha256(raw_file.path),
             )
+            file_reports.append(report)
+            stage_path = staging_dir / f"{raw_file.dataset}__{raw_file.path.name}.parquet"
+            try:
+                header = read_header(con, raw_file.path)
+                check_header(header, raw_file.path)
+                con.execute(
+                    build_stage_sql(
+                        raw_file.path,
+                        header,
+                        raw_file.dataset,
+                        cfg.ingest.timestamp_format,
+                        stage_path,
+                    )
+                )
+                audit_file(
+                    con,
+                    _parquet_relation([stage_path]),
+                    raw_file,
+                    report,
+                    cfg.ingest.max_failed_cast_rate,
+                )
+            except duckdb.Error as exc:
+                raise IngestError(f"{raw_file.path}: {exc}") from exc
+            staged.append(stage_path)
 
-    for year, month, duplicates in months:
-        rows = publish_month(con, stage, trips_dir, year, month)
-        published_by[(year, month)] = raw_file.as_posix()
-        report.months.append(MonthReport(year, month, rows, duplicates))
-
-    stage_path.unlink()
-    return report
+        relation = _parquet_relation(staged)
+        try:
+            check_unique_keys(con, relation, label)
+            month_report = summarize_month(con, relation, year, month, raw_files)
+            month_report.rows_published = publish_month(con, relation, trips_dir, year, month)
+        except duckdb.Error as exc:
+            raise IngestError(f"{label}: {exc}") from exc
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    return month_report
 
 
 def read_header(con: duckdb.DuckDBPyConnection, raw_file: Path) -> list[str]:
@@ -310,9 +447,6 @@ def build_stage_sql(
         return _quote_ident(col.raw_name) if col.raw_name in present else "NULL::VARCHAR"
 
     trip_id = _quote_ident(TRIP_ID.raw_name)
-    start_col = next(c for c in PARSED if c.name == "trip_start_timestamp")
-    start = parse_expr(start_col, raw(start_col), timestamp_format)
-
     select = [f"{trip_id} AS trip_id", f"{TRIP_KEY_SQL.format(raw=trip_id)} AS trip_key"]
     failure_bits = []
     for bit, col in enumerate(PARSED):
@@ -325,8 +459,6 @@ def build_stage_sql(
         f"({' + '.join(failure_bits)})::UINTEGER AS parse_failures",
         f"{_quote_str(dataset)} AS source_dataset",
         f"{_quote_str(raw_file.name)} AS source_file",
-        f"year({start}) AS year",
-        f"month({start}) AS month",
     ]
     columns = ",\n        ".join(select)
     source = _quote_str(raw_file.as_posix())
@@ -339,40 +471,51 @@ def build_stage_sql(
     """
 
 
-def audit_stage(
-    con: duckdb.DuckDBPyConnection, stage: str, report: FileReport, max_rate: float
-) -> list[tuple[int, int, int]]:
-    """Check a staged file's parse-failure rates and summarize it by month.
+def audit_file(
+    con: duckdb.DuckDBPyConnection,
+    stage: str,
+    raw_file: RawFile,
+    report: FileReport,
+    max_rate: float,
+) -> None:
+    """Check one staged file's parse failures and declared date range.
 
     Fills in the row counts and failed-cast counts on `report`.
 
     Args:
         con: DuckDB connection.
-        stage: SQL relation reading the staging Parquet file.
+        stage: SQL relation reading the file's staging Parquet file.
+        raw_file: The raw file, with the date range declared in its name.
         report: The file's report, updated in place.
-        max_rate: Largest allowed share of rows failing any one check.
-
-    Returns:
-        (year, month, duplicate trip IDs) for every month in the file.
+        max_rate: Largest allowed share of rows failing any one parse check.
 
     Raises:
         IngestError: If any column's failure rate, or the share of rows without a start
-            time, exceeds `max_rate`.
+            time, exceeds `max_rate`, or if any row starts outside the declared dates.
     """
     failure_sums = ", ".join(
         f"coalesce(sum((parse_failures >> {bit}) & 1), 0)::BIGINT AS {col.name}"
         for bit, col in enumerate(PARSED)
     )
+    start_date = "trip_start_timestamp::DATE"
     row = con.sql(f"""
         SELECT
             count(*)::BIGINT AS rows_read,
             count(*) FILTER (WHERE trip_start_timestamp IS NULL)::BIGINT AS rows_without_start,
+            count(*) FILTER (
+                WHERE {start_date} < DATE '{raw_file.start}' OR {start_date} > DATE '{raw_file.end}'
+            )::BIGINT AS rows_outside_range,
             {failure_sums}
         FROM {stage}
     """).fetchall()[0]
-    report.rows_read, report.rows_without_start = row[0], row[1]
-    report.failed_casts = {col.name: n for col, n in zip(PARSED, row[2:], strict=True)}
+    report.rows_read, report.rows_without_start, report.rows_outside_range = row[:3]
+    report.failed_casts = {col.name: n for col, n in zip(PARSED, row[3:], strict=True)}
 
+    if report.rows_outside_range:
+        raise IngestError(
+            f"{report.path}: {report.rows_outside_range:,} rows start outside the dates "
+            f"in the file name ({raw_file.start} to {raw_file.end})"
+        )
     if report.rows_read:
         too_many = {
             name: n
@@ -388,18 +531,9 @@ def audit_stage(
                 f"out of {report.rows_read:,} rows: {too_many}"
             )
 
-    months = con.sql(f"""
-        SELECT year, month, (count(trip_id) - count(DISTINCT trip_id))::BIGINT
-        FROM {stage}
-        WHERE year IS NOT NULL
-        GROUP BY year, month
-        ORDER BY year, month
-    """).fetchall()
-    return [(int(y), int(m), int(d)) for y, m, d in months]
 
-
-def check_unique_keys(con: duckdb.DuckDBPyConnection, relation: str) -> None:
-    """Verify that distinct trip IDs map to distinct trip keys within each month.
+def check_unique_keys(con: duckdb.DuckDBPyConnection, relation: str, label: str) -> None:
+    """Verify that distinct trip IDs map to distinct trip keys within one month.
 
     Duplicates of one trip share a start time, so they always fall in the same month;
     keys only need to be unique within a month. This check is exact, not probabilistic:
@@ -407,34 +541,108 @@ def check_unique_keys(con: duckdb.DuckDBPyConnection, relation: str) -> None:
 
     Args:
         con: DuckDB connection.
-        relation: SQL relation with trip_id, trip_key, year and month columns.
+        relation: SQL relation with the month's trip_id and trip_key columns, from all
+            of its files.
+        label: The month, named in the error message.
 
     Raises:
-        IngestError: If two different trip IDs in one month share a key.
+        IngestError: If two different trip IDs share a key.
     """
-    collisions = con.sql(f"""
-        SELECT year, month
+    distinct_ids, distinct_keys = con.sql(f"""
+        SELECT count(DISTINCT trip_id), count(DISTINCT trip_key) FROM {relation}
+    """).fetchall()[0]
+    if distinct_ids != distinct_keys:
+        raise IngestError(f"{label}: trip_key collision: two trip IDs share a 64-bit key")
+
+
+def summarize_month(
+    con: duckdb.DuckDBPyConnection,
+    relation: str,
+    year: int,
+    month: int,
+    raw_files: list[RawFile],
+) -> MonthReport:
+    """Count duplicates and measure how completely a month is covered.
+
+    Coverage is checked twice: from the dates declared in the file names (a missing
+    file shows up before any data is read) and from the trips actually present.
+
+    Args:
+        con: DuckDB connection.
+        relation: SQL relation with the month's staged rows from all of its files.
+        year: Year of the month.
+        month: Month (1-12).
+        raw_files: The month's raw files.
+
+    Returns:
+        The month's report, with everything except rows_published filled in.
+    """
+    duplicates, first_start, last_start, trip_days = con.sql(f"""
+        SELECT
+            (count(trip_id) - count(DISTINCT trip_id))::BIGINT,
+            min(trip_start_timestamp),
+            max(trip_start_timestamp),
+            list(DISTINCT trip_start_timestamp::DATE)
         FROM {relation}
-        WHERE year IS NOT NULL
-        GROUP BY year, month
-        HAVING count(DISTINCT trip_id) <> count(DISTINCT trip_key)
-    """).fetchall()
-    if collisions:
-        months = ", ".join(f"{y}-{m:02d}" for y, m in collisions)
-        raise IngestError(f"trip_key collision in {months}: two trip IDs share a 64-bit key")
+        WHERE trip_start_timestamp IS NOT NULL
+    """).fetchall()[0]
+
+    days_in_month = calendar.monthrange(year, month)[1]
+    all_days = {date(year, month, d) for d in range(1, days_in_month + 1)}
+    declared = {
+        f.start + timedelta(days=i) for f in raw_files for i in range((f.end - f.start).days + 1)
+    }
+    with_trips = set(trip_days or [])
+    return MonthReport(
+        year=year,
+        month=month,
+        source_files=[f.path.as_posix() for f in raw_files],
+        duplicates_removed=int(duplicates),
+        first_start=first_start,
+        last_start=last_start,
+        days_with_trips=len(with_trips),
+        missing_declared_days=sorted(all_days - declared),
+        days_without_trips=sorted(declared - with_trips),
+    )
+
+
+def month_warnings(report: MonthReport) -> list[str]:
+    """Describe gaps in a month's coverage.
+
+    Args:
+        report: The month's report.
+
+    Returns:
+        One warning per kind of gap found, or an empty list if the month is complete.
+    """
+    label = f"{report.year}-{report.month:02d}"
+    warnings = []
+    for days, problem in [
+        (report.missing_declared_days, "not covered by any raw file name"),
+        (report.days_without_trips, "covered by a raw file name but with no trips"),
+    ]:
+        if days:
+            shown = ", ".join(str(d) for d in days[:MAX_DAYS_IN_WARNING])
+            more = (
+                f" and {len(days) - MAX_DAYS_IN_WARNING} more"
+                if len(days) > MAX_DAYS_IN_WARNING
+                else ""
+            )
+            warnings.append(f"{label}: {len(days)} day(s) {problem}: {shown}{more}")
+    return warnings
 
 
 def publish_month(
-    con: duckdb.DuckDBPyConnection, stage: str, trips_dir: Path, year: int, month: int
+    con: duckdb.DuckDBPyConnection, relation: str, trips_dir: Path, year: int, month: int
 ) -> int:
-    """Deduplicate one month of staged rows and write it to interim, replacing old output.
+    """Deduplicate a month's staged rows and write them to interim, replacing old output.
 
     The file is written under a temporary name and then renamed, so readers never see a
     half-written month.
 
     Args:
         con: DuckDB connection.
-        stage: SQL relation reading the staging Parquet file.
+        relation: SQL relation with the month's staged rows from all of its files.
         trips_dir: Root of the published monthly Parquet files.
         year: Year of the month to publish.
         month: Month (1-12) to publish.
@@ -442,7 +650,7 @@ def publish_month(
     Returns:
         Number of rows written.
     """
-    month_dir = trips_dir / f"year={year}" / f"month={month}"
+    month_dir = trips_dir / f"year={year}" / f"month={month:02d}"
     month_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = month_dir / ".data.parquet.tmp"
     columns = ", ".join(["trip_key", *(c.name for c in PARSED), "source_dataset", "source_file"])
@@ -453,8 +661,8 @@ def publish_month(
                 SELECT
                     *,
                     row_number() OVER (PARTITION BY trip_id ORDER BY {DEDUP_ORDER}) AS copy_number
-                FROM {stage}
-                WHERE year = {year} AND month = {month}
+                FROM {relation}
+                WHERE trip_start_timestamp IS NOT NULL
             )
             WHERE trip_id IS NULL OR copy_number = 1
             ORDER BY {OUTPUT_ORDER}
@@ -472,7 +680,9 @@ def _write_manifest(
     started: datetime,
     status: str,
     error: str | None,
-    reports: list[FileReport],
+    file_reports: list[FileReport],
+    month_reports: list[MonthReport],
+    warnings: list[str],
 ) -> Path:
     """Write the run manifest as JSON.
 
@@ -482,7 +692,9 @@ def _write_manifest(
         started: When the run started, in UTC. Also used in the file name.
         status: "succeeded" or "failed".
         error: The error message if the run failed, otherwise None.
-        reports: Reports for the files processed before the run ended.
+        file_reports: Reports for the files processed before the run ended.
+        month_reports: Reports for the months published before the run ended.
+        warnings: Completeness warnings raised during the run.
 
     Returns:
         Location of the manifest file.
@@ -497,11 +709,26 @@ def _write_manifest(
         "git_commit": _git_commit(),
         "config_sha256": hashlib.sha256(cfg.model_dump_json().encode()).hexdigest(),
         "config": cfg.model_dump(mode="json"),
-        "files": [asdict(r) for r in reports],
+        "warnings": warnings,
+        "files": [asdict(r) for r in file_reports],
+        "months": [asdict(r) for r in month_reports],
     }
     path = manifest_dir / f"ingest-{started:%Y%m%dT%H%M%S}Z.json"
-    path.write_text(json.dumps(manifest, indent=2) + "\n")
+    path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
     return path
+
+
+def _parquet_relation(paths: list[Path]) -> str:
+    """Build a SQL relation that reads one or more Parquet files as a single table.
+
+    Args:
+        paths: The Parquet files to read.
+
+    Returns:
+        A read_parquet(...) expression usable in a FROM clause.
+    """
+    files = ", ".join(_quote_str(p.as_posix()) for p in paths)
+    return f"read_parquet([{files}])"
 
 
 def _sha256(path: Path, chunk_size: int = 1 << 20) -> str:

@@ -1,16 +1,27 @@
 import hashlib
 import json
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 import pytest
 
+import rideforecast.ingest
 from rideforecast.config import Config
-from rideforecast.ingest import TRIP_KEY_SQL, IngestError, check_unique_keys, run_ingest
+from rideforecast.ingest import (
+    TRIP_KEY_SQL,
+    IngestError,
+    check_unique_keys,
+    parse_raw_file,
+    run_ingest,
+)
 from rideforecast.schema import COLUMNS, PARSED
 
 from .conftest import HEADER_OLD, trip_row
+
+FIRST_HALF = "tnp_2024-03-01_to_2024-03-15.csv.gz"
+SECOND_HALF = "tnp_2024-03-16_to_2024-03-31.csv.gz"
 
 
 def read_trips(cfg: Config) -> list[dict]:
@@ -39,6 +50,9 @@ def published_files(cfg: Config) -> list[Path]:
         Paths of every published Parquet file, sorted.
     """
     return sorted((cfg.paths.interim / "trips").rglob("*.parquet"))
+
+
+# --- Parsing -----------------------------------------------------------------------------
 
 
 def test_values_parse_to_typed_columns(write_raw, make_cfg):
@@ -132,6 +146,9 @@ def test_old_dataset_gets_null_optional_columns(write_raw, make_cfg):
     assert trip["source_dataset"] == "m6dm-c72p"
 
 
+# --- Headers and parse failures ----------------------------------------------------------
+
+
 def test_unexpected_column_rejected(write_raw, make_cfg):
     """A column the schema doesn't know about fails ingest instead of being ignored."""
     header = [*HEADER_OLD, "Surprise Column"]
@@ -146,18 +163,6 @@ def test_missing_required_column_rejected(write_raw, make_cfg):
     write_raw([trip_row()], header=header)
     with pytest.raises(IngestError, match="missing required columns"):
         run_ingest(make_cfg())
-
-
-def test_duplicate_trip_ids_removed(write_raw, make_cfg):
-    """Two rows with the same trip ID publish as one, and the manifest counts it."""
-    write_raw([trip_row(1), trip_row(1), trip_row(2)])
-    cfg = make_cfg()
-    result = run_ingest(cfg)
-
-    assert len(read_trips(cfg)) == 2
-    [month] = result.files[0].months
-    assert month.duplicates_removed == 1
-    assert month.rows_published == 2
 
 
 def test_rows_without_start_time_excluded_and_counted(write_raw, make_cfg):
@@ -191,21 +196,186 @@ def test_failed_casts_within_threshold_become_null(write_raw, make_cfg):
     assert fares == [False, True]
 
 
-def test_partitions_by_start_month(write_raw, make_cfg):
-    """Trips are written to the folder of the month they started in."""
+# --- File names and declared dates -------------------------------------------------------
+
+
+def test_file_name_dates_parsed():
+    """The dataset comes from the folder and the dates from the file name."""
+    raw_file = parse_raw_file(Path("data/raw/n26f-ihde/tnp_2024-01-01_to_2024-01-15.csv.gz"))
+    assert raw_file.dataset == "n26f-ihde"
+    assert (raw_file.start, raw_file.end) == (date(2024, 1, 1), date(2024, 1, 15))
+    assert raw_file.month == (2024, 1)
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("trips.csv.gz", "name must look like"),
+        ("tnp_2024-01-01_to_2024-02-01.csv.gz", "more than one month"),
+        ("tnp_2024-01-15_to_2024-01-01.csv.gz", "end date is before start date"),
+        ("tnp_2024-02-30_to_2024-02-31.csv.gz", "invalid date"),
+    ],
+)
+def test_invalid_file_name_rejected(write_raw, make_cfg, name, message):
+    """A file whose name breaks the naming contract fails before anything is published."""
+    write_raw([trip_row()], name=name)
+    cfg = make_cfg()
+    with pytest.raises(IngestError, match=message):
+        run_ingest(cfg)
+    assert published_files(cfg) == []
+
+
+def test_rows_outside_declared_dates_rejected(write_raw, make_cfg):
+    """A file containing trips outside the dates in its name is rejected."""
     write_raw(
-        [
-            trip_row(1, Trip_Start_Timestamp="03/31/2024 11:45:00 PM"),
-            trip_row(2, Trip_Start_Timestamp="04/01/2024 12:00:00 AM"),
-        ]
+        [trip_row(1), trip_row(2, Trip_Start_Timestamp="03/20/2024 09:00:00 AM")],
+        name=FIRST_HALF,
     )
     cfg = make_cfg()
-    run_ingest(cfg)
+    with pytest.raises(IngestError, match="1 rows start outside the dates"):
+        run_ingest(cfg)
+    assert published_files(cfg) == []
+
+
+# --- Months -------------------------------------------------------------------------------
+
+
+def test_each_month_published_to_zero_padded_folder(write_raw, make_cfg):
+    """Each month gets one file, in a folder with a two-digit month."""
+    write_raw([trip_row(1)], name="tnp_2024-03-01_to_2024-03-31.csv.gz")
+    write_raw(
+        [trip_row(2, Trip_Start_Timestamp="12/05/2023 08:00:00 AM")],
+        name="tnp_2023-12-01_to_2023-12-31.csv.gz",
+    )
+    cfg = make_cfg()
+    result = run_ingest(cfg)
 
     dirs = [
         p.parent.relative_to(cfg.paths.interim / "trips").as_posix() for p in published_files(cfg)
     ]
-    assert dirs == ["year=2024/month=3", "year=2024/month=4"]
+    assert dirs == ["year=2023/month=12", "year=2024/month=03"]
+    assert [(m.year, m.month) for m in result.months] == [(2023, 12), (2024, 3)]
+
+
+def test_split_month_combined_into_one_file(write_raw, make_cfg):
+    """Two files covering halves of a month publish as one complete month."""
+    write_raw([trip_row(1, Trip_Start_Timestamp="03/02/2024 09:00:00 AM")], name=FIRST_HALF)
+    write_raw([trip_row(2, Trip_Start_Timestamp="03/20/2024 09:00:00 AM")], name=SECOND_HALF)
+    cfg = make_cfg()
+    result = run_ingest(cfg)
+
+    assert len(published_files(cfg)) == 1
+    assert len(read_trips(cfg)) == 2
+    [month] = result.months
+    assert len(month.source_files) == 2
+    assert month.missing_declared_days == []
+
+
+def test_overlapping_files_deduplicated(write_raw, make_cfg):
+    """A trip that appears in two overlapping files is published once."""
+    shared = trip_row(1, Trip_Start_Timestamp="03/15/2024 09:00:00 AM")
+    write_raw([shared], name=FIRST_HALF)
+    write_raw([shared], name="tnp_2024-03-15_to_2024-03-31.csv.gz")
+    cfg = make_cfg()
+    result = run_ingest(cfg)
+
+    assert len(read_trips(cfg)) == 1
+    assert result.months[0].duplicates_removed == 1
+
+
+def test_duplicate_trip_ids_removed(write_raw, make_cfg):
+    """Two rows with the same trip ID in one file publish as one, and the manifest counts it."""
+    write_raw([trip_row(1), trip_row(1), trip_row(2)])
+    cfg = make_cfg()
+    result = run_ingest(cfg)
+
+    assert len(read_trips(cfg)) == 2
+    [month] = result.months
+    assert month.duplicates_removed == 1
+    assert month.rows_published == 2
+
+
+def test_failed_month_does_not_affect_earlier_months(write_raw, make_cfg):
+    """A bad file stops its own month; months before it stay published."""
+    write_raw(
+        [trip_row(1, Trip_Start_Timestamp="02/10/2024 09:00:00 AM")],
+        name="tnp_2024-02-01_to_2024-02-29.csv.gz",
+    )
+    write_raw([trip_row(2, Fare="oops")])
+    cfg = make_cfg()
+    with pytest.raises(IngestError, match="fare"):
+        run_ingest(cfg)
+
+    dirs = [p.parent.name for p in published_files(cfg)]
+    assert dirs == ["month=02"]
+
+
+def test_bad_file_blocks_whole_month(write_raw, make_cfg):
+    """If one of a month's files fails, none of that month is published."""
+    write_raw([trip_row(1, Trip_Start_Timestamp="03/02/2024 09:00:00 AM")], name=FIRST_HALF)
+    write_raw(
+        [trip_row(2, Trip_Start_Timestamp="03/20/2024 09:00:00 AM", Fare="oops")],
+        name=SECOND_HALF,
+    )
+    cfg = make_cfg()
+    with pytest.raises(IngestError):
+        run_ingest(cfg)
+    assert published_files(cfg) == []
+
+
+def test_key_collision_raises():
+    """Two different trip IDs with the same key in one month fail the check."""
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TABLE staged AS
+        SELECT * FROM (VALUES ('id-a', 42::UBIGINT), ('id-b', 42::UBIGINT))
+            AS t(trip_id, trip_key)
+    """)
+    with pytest.raises(IngestError, match="2024-03: trip_key collision"):
+        check_unique_keys(con, "staged", "2024-03")
+
+
+def test_same_trip_same_key_is_not_a_collision():
+    """Duplicates of one trip share a key legitimately."""
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TABLE staged AS
+        SELECT * FROM (VALUES ('id-a', 42::UBIGINT), ('id-a', 42::UBIGINT))
+            AS t(trip_id, trip_key)
+    """)
+    check_unique_keys(con, "staged", "2024-03")
+
+
+# --- Completeness warnings ---------------------------------------------------------------
+
+
+def test_days_missing_from_file_names_warned(write_raw, make_cfg):
+    """A month whose file names leave out days gets a warning, not an error."""
+    write_raw([trip_row(1, Trip_Start_Timestamp="03/02/2024 09:00:00 AM")], name=FIRST_HALF)
+    cfg = make_cfg()
+    result = run_ingest(cfg)
+
+    [month] = result.months
+    assert month.missing_declared_days[0] == date(2024, 3, 16)
+    assert len(month.missing_declared_days) == 16
+    assert any("16 day(s) not covered by any raw file name" in w for w in result.warnings)
+
+
+def test_declared_days_without_trips_warned(write_raw, make_cfg):
+    """Days a file claims to cover but has no trips for are reported."""
+    write_raw([trip_row(1)])  # declares all of March, but every trip is on March 10
+    cfg = make_cfg()
+    result = run_ingest(cfg)
+
+    [month] = result.months
+    assert month.days_with_trips == 1
+    assert len(month.days_without_trips) == 30
+    assert any(
+        "30 day(s) covered by a raw file name but with no trips" in w for w in result.warnings
+    )
+
+
+# --- Runs and manifest ---------------------------------------------------------------------
 
 
 def test_rerun_gives_identical_output(write_raw, make_cfg):
@@ -220,51 +390,23 @@ def test_rerun_gives_identical_output(write_raw, make_cfg):
     assert len(published_files(cfg)) == 1
 
 
-def test_month_split_across_files_rejected(write_raw, make_cfg):
-    """Deduplication only works if one file holds all of a month's trips."""
-    write_raw([trip_row(1)], name="a.csv.gz")
-    write_raw([trip_row(2)], name="b.csv.gz")
-    with pytest.raises(IngestError, match="already published"):
-        run_ingest(make_cfg())
-
-
-def test_key_collision_raises():
-    """Two different trip IDs with the same key in one month fail the check."""
-    con = duckdb.connect()
-    con.execute("""
-        CREATE TABLE staged AS
-        SELECT * FROM (VALUES ('id-a', 42::UBIGINT, 2024, 3), ('id-b', 42::UBIGINT, 2024, 3))
-            AS t(trip_id, trip_key, year, month)
-    """)
-    with pytest.raises(IngestError, match="collision in 2024-03"):
-        check_unique_keys(con, "staged")
-
-
-def test_same_trip_same_key_is_not_a_collision():
-    """Duplicates of one trip share a key legitimately."""
-    con = duckdb.connect()
-    con.execute("""
-        CREATE TABLE staged AS
-        SELECT * FROM (VALUES ('id-a', 42::UBIGINT, 2024, 3), ('id-a', 42::UBIGINT, 2024, 3))
-            AS t(trip_id, trip_key, year, month)
-    """)
-    check_unique_keys(con, "staged")
-
-
 def test_manifest_records_run(write_raw, make_cfg):
-    """The manifest records the status, checksum, rows read and months published."""
+    """The manifest records the status, checksums, file reports and month reports."""
     raw_file = write_raw([trip_row(1), trip_row(2)])
     cfg = make_cfg()
     result = run_ingest(cfg)
 
     manifest = json.loads(result.manifest_path.read_text())
     assert manifest["status"] == "succeeded"
-    [entry] = manifest["files"]
-    assert entry["sha256"] == hashlib.sha256(raw_file.read_bytes()).hexdigest()
-    assert entry["rows_read"] == 2
-    assert entry["months"] == [
-        {"year": 2024, "month": 3, "rows_published": 2, "duplicates_removed": 0}
-    ]
+    [file_entry] = manifest["files"]
+    assert file_entry["sha256"] == hashlib.sha256(raw_file.read_bytes()).hexdigest()
+    assert file_entry["rows_read"] == 2
+    assert file_entry["declared_start"] == "2024-03-01"
+    [month_entry] = manifest["months"]
+    assert (month_entry["year"], month_entry["month"]) == (2024, 3)
+    assert month_entry["rows_published"] == 2
+    assert month_entry["source_files"] == [raw_file.as_posix()]
+    assert manifest["warnings"]
 
 
 def test_failed_run_still_writes_manifest(write_raw, make_cfg):
@@ -278,6 +420,7 @@ def test_failed_run_still_writes_manifest(write_raw, make_cfg):
     manifest = json.loads(path.read_text())
     assert manifest["status"] == "failed"
     assert "fare" in manifest["error"]
+    assert manifest["files"][0]["failed_casts"]["fare"] == 1
 
 
 def test_no_raw_files_raises(make_cfg):
@@ -286,9 +429,41 @@ def test_no_raw_files_raises(make_cfg):
         run_ingest(make_cfg())
 
 
+def test_only_one_month_staged_at_a_time(write_raw, make_cfg, monkeypatch):
+    """Each month's staging is deleted before the next month starts."""
+    write_raw(
+        [trip_row(1, Trip_Start_Timestamp="02/10/2024 09:00:00 AM")],
+        name="tnp_2024-02-01_to_2024-02-29.csv.gz",
+    )
+    write_raw([trip_row(2)])
+    cfg = make_cfg()
+    staging_dir = cfg.paths.interim / "_staging"
+    staged_at_publish = []
+    real_publish = rideforecast.ingest.publish_month
+
+    def recording_publish(*args, **kwargs):
+        """Record which month folders exist in staging, then publish as normal."""
+        staged_at_publish.append(sorted(p.name for p in staging_dir.iterdir()))
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(rideforecast.ingest, "publish_month", recording_publish)
+    run_ingest(cfg)
+
+    assert staged_at_publish == [["2024-02"], ["2024-03"]]
+
+
 def test_staging_is_cleaned_up(write_raw, make_cfg):
     """The staging directory is removed after the run."""
     write_raw([trip_row()])
     cfg = make_cfg()
     run_ingest(cfg)
+    assert not (cfg.paths.interim / "_staging").exists()
+
+
+def test_staging_is_cleaned_up_after_failure(write_raw, make_cfg):
+    """A failed month's staging files are removed too."""
+    write_raw([trip_row(1, Fare="oops")])
+    cfg = make_cfg()
+    with pytest.raises(IngestError):
+        run_ingest(cfg)
     assert not (cfg.paths.interim / "_staging").exists()

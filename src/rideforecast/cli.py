@@ -59,12 +59,13 @@ def ingest(config: ConfigOption = DEFAULT_CONFIG) -> None:
     except IngestError as exc:
         typer.echo(f"[ingest] failed: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    for report in result.files:
-        published = sum(m.rows_published for m in report.months)
+    for report in result.months:
         typer.echo(
-            f"[ingest] {report.path}: {report.rows_read:,} rows read, "
-            f"{published:,} published across {len(report.months)} month(s)"
+            f"[ingest] {report.year}-{report.month:02d}: {report.rows_published:,} rows "
+            f"published from {len(report.source_files)} file(s)"
         )
+    for warning in result.warnings:
+        typer.echo(f"[ingest] warning: {warning}", err=True)
     typer.echo(f"[ingest] manifest: {result.manifest_path}")
 
 
