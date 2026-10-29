@@ -17,6 +17,11 @@ def make_valid_data() -> dict[str, dict]:
     return {
         "paths": {"raw": "a", "interim": "b", "processed": "c"},
         "forecast": {"horizons": [1, 2], "bin": "1h", "grain": "community_area"},
+        "ingest": {
+            "raw_glob": "*/*.csv.gz",
+            "timestamp_format": "%m/%d/%Y %I:%M:%S %p",
+            "max_failed_cast_rate": 0.0001,
+        },
     }
 
 
@@ -45,6 +50,14 @@ def test_unsupported_bin_rejected():
     data = make_valid_data()
     data["forecast"]["bin"] = "15min"
     with pytest.raises(ValidationError, match="Input should be '1h'"):
+        Config.model_validate(data)
+
+
+def test_failed_cast_rate_above_one_rejected():
+    """A rate is a share of rows, so it must lie between 0 and 1."""
+    data = make_valid_data()
+    data["ingest"]["max_failed_cast_rate"] = 5
+    with pytest.raises(ValidationError, match="less than or equal to 1"):
         Config.model_validate(data)
 
 
