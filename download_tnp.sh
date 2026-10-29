@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Download Chicago rideshare (TNP) trips for a date range as CSV.
-# Create an .env file structured like .env.example.
+# Download Chicago rideshare (TNP) trips for a date range as compressed CSV.
 # API key can be obtained by creating an account at https://data.cityofchicago.org
 #
 # Usage:
@@ -8,7 +7,9 @@
 #
 #   START_DATE  first day to include, YYYY-MM-DD
 #   END_DATE    first day NOT included, YYYY-MM-DD (e.g. 2024-05-01 for all of April)
-#   OUTPUT_FILE optional; defaults to ./data/tnp_START_to_END.csv
+#   OUTPUT_FILE optional; defaults to ./data/tnp_START_to_END.csv.gz
+#               A path ending in .gz is compressed during the download;
+#               any other path (e.g. .csv) is saved as plain CSV.
 #
 # Optional: set COLUMNS to limit the columns (much smaller, faster downloads), e.g.
 #   COLUMNS="trip_start_timestamp, trip_miles, fare" ./download_tnp.sh 2024-04-01 2024-05-01
@@ -25,7 +26,6 @@ fi
 
 START="$1"
 END="$2"
-OUT="${3:-./data/raw/tnp_${START}_to_${END}.csv}"
 COLUMNS="${COLUMNS:-*}"
 
 # Load credentials from .env
@@ -51,16 +51,39 @@ elif [[ "$START" < "2025-01-01" ]]; then DATASET="n26f-ihde"   # 2023-2024
 else                                     DATASET="6dvr-xwnh"   # 2025-
 fi
 
+OUT="${3:-./data/raw/${DATASET}/tnp_${START}_to_${END}.csv.gz}"
+
 QUERY="SELECT ${COLUMNS} WHERE trip_start_timestamp >= '${START}T00:00:00' AND trip_start_timestamp < '${END}T00:00:00'"
 
 echo "Dataset: $DATASET"
 echo "Range:   $START (inclusive) to $END (exclusive)"
 echo "Output:  $OUT"
 
-curl -u "$SOCRATA_KEY_ID:$SOCRATA_KEY_SECRET" \
-  -X POST "https://data.cityofchicago.org/api/v3/views/${DATASET}/export.csv" \
-  -H "Content-Type: application/json" \
-  -d "{\"query\": \"${QUERY}\"}" \
-  --fail --create-dirs -o "$OUT"
+mkdir -p "$(dirname "$OUT")"
 
-echo "Done: $(wc -l < "$OUT") lines saved to $OUT"
+if ! : > "$OUT" 2>/dev/null; then
+  echo "Error: cannot write to $OUT (check folder permissions)" >&2
+  exit 1
+fi
+
+# Remove a partial output file if the download fails or is interrupted
+trap 'rm -f "$OUT"; echo "Download failed; removed partial $OUT" >&2' ERR INT
+
+fetch() {
+  curl -u "$SOCRATA_KEY_ID:$SOCRATA_KEY_SECRET" \
+    -X POST "https://data.cityofchicago.org/api/v3/views/${DATASET}/export.csv" \
+    -H "Content-Type: application/json" \
+    -d "{\"query\": \"${QUERY}\"}" \
+    --compressed --fail
+}
+
+if [[ "$OUT" == *.gz ]]; then
+  fetch | gzip -9 > "$OUT"
+  lines=$(gzip -dc "$OUT" | wc -l)
+else
+  fetch > "$OUT"
+  lines=$(wc -l < "$OUT")
+fi
+
+trap - ERR INT
+echo "Done: $((lines)) lines saved to $OUT ($(du -h "$OUT" | cut -f1))"
