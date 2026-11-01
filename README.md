@@ -2,7 +2,7 @@
 
 Short-term spatiotemporal demand forecasting on Chicago rideshare (TNP) trip data.
 
-> **Status:** ingest implemented. The remaining stages are CLI stubs.
+> **Status:** ingest and panel implemented. The remaining stages are CLI stubs.
 
 ## The forecasting task
 
@@ -36,7 +36,7 @@ so any stage can be rerun in isolation.
 | Stage | Command | Reads | Writes | Status |
 |---|---|---|---|---|
 | Ingest | `uv run rideforecast ingest` | `data/raw` | `data/interim/trips` | done |
-| Panel | `uv run rideforecast panel` | `data/interim` | `data/processed` | not implemented |
+| Panel | `uv run rideforecast panel` | `data/interim/trips` | `data/processed/panel.parquet` | done |
 | Features | `uv run rideforecast features` | `data/processed` | `data/processed` | not implemented |
 | Train | `uv run rideforecast train` | `data/processed` | models | not implemented |
 | Backtest | `uv run rideforecast backtest` | models + features | metrics | not implemented |
@@ -84,17 +84,39 @@ SELECT * FROM read_parquet(
 )
 ```
 
+## Panel
+
+`panel` counts pickups per community area per local clock hour, on a complete grid: every
+area has a row for every hour from the first to the last day with trips.
+
+| Column | Meaning |
+|---|---|
+| `community_area` | 1 to 77 |
+| `start_hour` | Start of the local clock hour (America/Chicago); the row covers `start_hour` up to the next hour |
+| `pickups` | Trips starting in that area and hour. 0 means no pickups; NULL means no trips anywhere in the city that hour (missing data) |
+| `data_gap` | True when `pickups` is NULL |
+| `dst_ambiguous` | True for the fall-back 1 AM hour, which holds two real hours of trips |
+
+The spring-forward 2 AM hour has no row. Trips without a pickup community area are counted
+per hour in `data/processed/unknown_area_pickups.parquet`, so the two files reconcile
+exactly with interim. See [ADR 0003](docs/decisions/0003-panel-design.md).
+
 ## Repository layout
 
 ```
-configs/        YAML configuration
-docs/decisions/ architecture decision records (ADRs)
-sql/            DuckDB queries (planned)
+configs/          YAML configuration
+docs/decisions/   architecture decision records (ADRs)
+notebooks/        exploration notebooks
 src/rideforecast/
-  config.py     typed config loading and validation
-  cli.py        one command per pipeline stage
-tests/unit/     unit tests
-data/           raw, interim, processed (gitignored)
+  config.py       typed config loading and validation
+  cli.py          one command per pipeline stage
+  schema.py       raw column names, types and parsing rules
+  ingest.py       raw CSV -> monthly interim Parquet
+  panel.py        interim trips -> pickup panel
+  common.py       helpers shared by the stages
+  sql/            DuckDB queries
+tests/unit/       unit tests
+data/             raw, interim, processed (gitignored)
 ```
 
 ## Development

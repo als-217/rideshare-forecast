@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from rideforecast.config import Config, load_config
 from rideforecast.ingest import IngestError, run_ingest
+from rideforecast.panel import PanelError, run_panel
 
 DEFAULT_CONFIG = Path("configs/base.yaml")
 
@@ -69,18 +70,39 @@ def ingest(config: ConfigOption = DEFAULT_CONFIG) -> None:
     typer.echo(f"[ingest] manifest: {result.manifest_path}")
 
 
-@app.command(help="Aggregate trips into a zone x hour panel with DuckDB.")
+@app.command(help="Aggregate trips into a community area x hour pickup panel.")
 def panel(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Run the panel stage (interim -> processed).
 
     Args:
         config: Path to the YAML config file.
+
+    Raises:
+        typer.Exit: With code 1 if there are no interim trips or the panel fails an
+            audit check.
     """
     cfg = _load(config)
+    try:
+        result = run_panel(cfg)
+    except PanelError as exc:
+        typer.echo(f"[panel] failed: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    stats = result.stats
     typer.echo(
-        f"[panel] {cfg.paths.interim} -> {cfg.paths.processed} "
-        f"(grain={cfg.forecast.grain}, bin={cfg.forecast.bin}) (not implemented)"
+        f"[panel] {stats.trips:,} trips, {stats.hours:,} hours "
+        f"from {stats.first_hour} to {stats.last_hour}"
     )
+    typer.echo(f"[panel] panel: {result.panel_path}")
+    typer.echo(
+        f"[panel] {stats.unknown_area_trips:,} trips without a pickup area: "
+        f"{result.unknown_area_path}"
+    )
+    if stats.gap_hours:
+        typer.echo(
+            f"[panel] {stats.gap_hours:,} hours have no trips citywide and are stored as NULL "
+            f"(by month in the manifest)"
+        )
+    typer.echo(f"[panel] manifest: {result.manifest_path}")
 
 
 @app.command(help="Build leakage-safe model features with Polars.")

@@ -29,3 +29,11 @@ repos:
     rev: 0.8.1
     hooks:
       - id: nbstripout
+
+  - repo: local
+    hooks:
+      - id: sqlfluff
+        name: sqlfluff
+        entry: uv run sqlfluff lint
+        language: system
+        files: \.sql$

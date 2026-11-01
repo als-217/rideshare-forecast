@@ -24,17 +24,16 @@ writes to `interim/_manifests/`, whether it succeeds or fails.
 
 import calendar
 import hashlib
-import json
 import os
 import re
 import shutil
-import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
+from rideforecast.common import quote_ident, quote_str, write_manifest
 from rideforecast.config import Config
 from rideforecast.schema import PARSED, RAW_NAMES, REQUIRED_RAW_NAMES, TRIP_ID, Column
 
@@ -214,8 +213,18 @@ def run_ingest(cfg: Config) -> IngestResult:
     finally:
         con.close()
         shutil.rmtree(staging_dir, ignore_errors=True)
-        manifest_path = _write_manifest(
-            manifest_dir, cfg, started, status, error, file_reports, month_reports, warnings
+        manifest_path = write_manifest(
+            manifest_dir,
+            "ingest",
+            cfg,
+            started,
+            status,
+            error,
+            {
+                "warnings": warnings,
+                "files": [asdict(r) for r in file_reports],
+                "months": [asdict(r) for r in month_reports],
+            },
         )
     return IngestResult(manifest_path, file_reports, month_reports, warnings)
 
@@ -357,7 +366,7 @@ def read_header(con: duckdb.DuckDBPyConnection, raw_file: Path) -> list[str]:
     Returns:
         The column names, in file order.
     """
-    source = _quote_str(raw_file.as_posix())
+    source = quote_str(raw_file.as_posix())
     return con.sql(f"SELECT * FROM read_csv({source}, all_varchar = true) LIMIT 0").columns
 
 
@@ -402,7 +411,7 @@ def parse_expr(col: Column, raw_sql: str, timestamp_format: str) -> str:
     """
     match col.kind:
         case "timestamp":
-            return f"try_strptime({raw_sql}, {_quote_str(timestamp_format)})"
+            return f"try_strptime({raw_sql}, {quote_str(timestamp_format)})"
         case "number":
             cleaned = f"replace(replace(trim({raw_sql}), '$', ''), ',', '')"
             return f"TRY_CAST({cleaned} AS {col.sql_type})"
@@ -444,9 +453,9 @@ def build_stage_sql(
         Returns:
             The quoted column name, or a typed NULL if the file lacks the column.
         """
-        return _quote_ident(col.raw_name) if col.raw_name in present else "NULL::VARCHAR"
+        return quote_ident(col.raw_name) if col.raw_name in present else "NULL::VARCHAR"
 
-    trip_id = _quote_ident(TRIP_ID.raw_name)
+    trip_id = quote_ident(TRIP_ID.raw_name)
     select = [f"{trip_id} AS trip_id", f"{TRIP_KEY_SQL.format(raw=trip_id)} AS trip_key"]
     failure_bits = []
     for bit, col in enumerate(PARSED):
@@ -457,17 +466,17 @@ def build_stage_sql(
         )
     select += [
         f"({' + '.join(failure_bits)})::UINTEGER AS parse_failures",
-        f"{_quote_str(dataset)} AS source_dataset",
-        f"{_quote_str(raw_file.name)} AS source_file",
+        f"{quote_str(dataset)} AS source_dataset",
+        f"{quote_str(raw_file.name)} AS source_file",
     ]
     columns = ",\n        ".join(select)
-    source = _quote_str(raw_file.as_posix())
+    source = quote_str(raw_file.as_posix())
     return f"""
     COPY (
         SELECT
         {columns}
         FROM read_csv({source}, all_varchar = true)
-    ) TO {_quote_str(out_path.as_posix())} (FORMAT parquet)
+    ) TO {quote_str(out_path.as_posix())} (FORMAT parquet)
     """
 
 
@@ -666,56 +675,12 @@ def publish_month(
             )
             WHERE trip_id IS NULL OR copy_number = 1
             ORDER BY {OUTPUT_ORDER}
-        ) TO {_quote_str(tmp_path.as_posix())} (FORMAT parquet, COMPRESSION zstd)
+        ) TO {quote_str(tmp_path.as_posix())} (FORMAT parquet, COMPRESSION zstd)
     """).fetchall()[0][0]
     for old in month_dir.glob("*.parquet"):
         old.unlink()
     os.replace(tmp_path, month_dir / "data.parquet")
     return int(rows)
-
-
-def _write_manifest(
-    manifest_dir: Path,
-    cfg: Config,
-    started: datetime,
-    status: str,
-    error: str | None,
-    file_reports: list[FileReport],
-    month_reports: list[MonthReport],
-    warnings: list[str],
-) -> Path:
-    """Write the run manifest as JSON.
-
-    Args:
-        manifest_dir: Directory to write the manifest into.
-        cfg: Config used for the run, recorded in full along with its checksum.
-        started: When the run started, in UTC. Also used in the file name.
-        status: "succeeded" or "failed".
-        error: The error message if the run failed, otherwise None.
-        file_reports: Reports for the files processed before the run ended.
-        month_reports: Reports for the months published before the run ended.
-        warnings: Completeness warnings raised during the run.
-
-    Returns:
-        Location of the manifest file.
-    """
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "stage": "ingest",
-        "status": status,
-        "error": error,
-        "started_utc": started.isoformat(),
-        "finished_utc": datetime.now(UTC).isoformat(),
-        "git_commit": _git_commit(),
-        "config_sha256": hashlib.sha256(cfg.model_dump_json().encode()).hexdigest(),
-        "config": cfg.model_dump(mode="json"),
-        "warnings": warnings,
-        "files": [asdict(r) for r in file_reports],
-        "months": [asdict(r) for r in month_reports],
-    }
-    path = manifest_dir / f"ingest-{started:%Y%m%dT%H%M%S}Z.json"
-    path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
-    return path
 
 
 def _parquet_relation(paths: list[Path]) -> str:
@@ -727,7 +692,7 @@ def _parquet_relation(paths: list[Path]) -> str:
     Returns:
         A read_parquet(...) expression usable in a FROM clause.
     """
-    files = ", ".join(_quote_str(p.as_posix()) for p in paths)
+    files = ", ".join(quote_str(p.as_posix()) for p in paths)
     return f"read_parquet([{files}])"
 
 
@@ -748,42 +713,3 @@ def _sha256(path: Path, chunk_size: int = 1 << 20) -> str:
         while chunk := f.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _git_commit() -> str | None:
-    """Look up the current git commit.
-
-    Returns:
-        The commit hash, or None if git is unavailable or this is not a repository.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return result.stdout.strip()
-
-
-def _quote_ident(name: str) -> str:
-    """Quote a SQL identifier, such as a column name containing spaces.
-
-    Args:
-        name: The identifier to quote.
-
-    Returns:
-        The identifier in double quotes, with any inner double quotes escaped.
-    """
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _quote_str(value: str) -> str:
-    """Quote a value as a SQL string literal.
-
-    Args:
-        value: The string to quote.
-
-    Returns:
-        The value in single quotes, with any inner single quotes escaped.
-    """
-    return "'" + value.replace("'", "''") + "'"
