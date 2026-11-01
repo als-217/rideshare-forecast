@@ -30,6 +30,7 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "ruff>=0.17.3",
+    "sqlfluff>=4.5.0",
 ]
 notebook = [
     "ipykernel>=7.4.0",
@@ -61,3 +62,7 @@ pythonVersion = "3.12"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
+
+[tool.sqlfluff.core]
+dialect = "duckdb"
+max_line_length = 100

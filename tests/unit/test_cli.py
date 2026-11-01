@@ -9,7 +9,7 @@ from .conftest import trip_row
 runner = CliRunner()
 
 STAGES = ["ingest", "panel", "features", "train", "backtest"]
-STUB_STAGES = ["panel", "features", "train", "backtest"]
+STUB_STAGES = ["features", "train", "backtest"]
 
 
 def test_help_lists_every_stage():
@@ -70,3 +70,23 @@ def test_ingest_failure_exits_with_error(write_raw, make_cfg, tmp_path):
     result = runner.invoke(app, ["ingest", "--config", str(config_path)])
     assert result.exit_code == 1
     assert "[ingest] failed" in result.output
+
+
+def test_panel_succeeds_on_interim_trips(write_interim, make_cfg, tmp_path):
+    """The panel command builds the panel and reports where it was written."""
+    write_interim([("2024-03-12 08:15:00", 8), ("2024-03-12 09:00:00", None)])
+    config_path = write_config(make_cfg(), tmp_path)
+
+    result = runner.invoke(app, ["panel", "--config", str(config_path)])
+    assert result.exit_code == 0, result.output
+    assert "2 trips, 24 hours" in result.output
+    assert "1 trips without a pickup area" in result.output
+
+
+def test_panel_without_interim_exits_with_error(make_cfg, tmp_path):
+    """Running the panel before ingest gives exit code 1 and a clear message."""
+    config_path = write_config(make_cfg(), tmp_path)
+
+    result = runner.invoke(app, ["panel", "--config", str(config_path)])
+    assert result.exit_code == 1
+    assert "Run ingest first" in result.output

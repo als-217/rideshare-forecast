@@ -10,6 +10,7 @@ import hashlib
 from collections.abc import Callable
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from rideforecast.config import Config
@@ -163,3 +164,43 @@ def make_cfg(tmp_path: Path, raw_dir: Path) -> Callable[..., Config]:
         )
 
     return _make
+
+
+@pytest.fixture
+def write_interim(tmp_path: Path) -> Callable[..., Path]:
+    """Provide a function that writes trips directly to the interim directory.
+
+    Panel tests use this instead of running ingest, so they depend only on the two
+    columns the panel reads.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        A function that writes one interim Parquet file.
+    """
+
+    def _write(trips: list[tuple[str, int | None]], month_dir: str = "year=2024/month=03") -> Path:
+        """Write trips to an interim month file.
+
+        Args:
+            trips: (start timestamp as "YYYY-MM-DD HH:MM:SS", pickup community area or
+                None) for each trip.
+            month_dir: Folder under interim/trips to write into.
+
+        Returns:
+            Location of the written file.
+        """
+        path = tmp_path / "data" / "interim" / "trips" / month_dir / "data.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect()
+        con.execute(
+            "CREATE TABLE t (trip_start_timestamp TIMESTAMP, pickup_community_area SMALLINT)"
+        )
+        if trips:
+            con.executemany("INSERT INTO t VALUES (?, ?)", trips)
+        con.execute(f"COPY t TO '{path.as_posix()}' (FORMAT parquet)")
+        con.close()
+        return path
+
+    return _write
